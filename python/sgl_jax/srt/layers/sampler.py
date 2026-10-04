@@ -25,10 +25,18 @@ class Sampler(nnx.Module):
         self.rngs = rngs
         self.mesh = mesh
 
+    @staticmethod
+    def _needs_logprobs(sampling_metadata) -> bool:
+        # Logprobs over the whole vocab cost two vocab-wide reductions per step;
+        # only compute them when a request asks for logprobs.
+        return sampling_metadata.return_logprob or sampling_metadata.return_output_logprob_only
+
     def _greedy_sampling(self, operands):
         """Greedy sampling branch"""
-        logits, _, _ = operands
+        logits, sampling_metadata, _ = operands
         batch_next_token_ids = jnp.argmax(logits, -1).flatten()
+        if not self._needs_logprobs(sampling_metadata):
+            return batch_next_token_ids, None
         logprobs = jax.nn.log_softmax(logits, axis=-1)
         return batch_next_token_ids, logprobs
 
@@ -66,9 +74,14 @@ class Sampler(nnx.Module):
         )
         batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_jax_with_mask(args)
 
+        batch_next_token_ids = jax.sharding.reshard(
+            batch_next_token_ids, NamedSharding(self.mesh, P("data"))
+        )
+        if not self._needs_logprobs(sampling_metadata):
+            return batch_next_token_ids, None
         log_probs = jnp.log(probs).clip(min=jnp.finfo(probs.dtype).min)
         return (
-            jax.sharding.reshard(batch_next_token_ids, NamedSharding(self.mesh, P("data"))),
+            batch_next_token_ids,
             jax.sharding.reshard(log_probs, NamedSharding(self.mesh, P("data", "tensor"))),
         )
 

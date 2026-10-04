@@ -71,6 +71,9 @@ class SamplingMetadata:
     vocab_mask: jax.Array | None = None
     apply_vocab_mask: bool = False
 
+    # Only the sampled tokens' logprobs are requested (computed from the sampler's logprobs).
+    return_output_logprob_only: bool = False
+
     def update_vocab_mask(self, mask, mesh, vocab_size):
         sharding = NamedSharding(mesh, PartitionSpec())
         self.apply_vocab_mask = _sampler_bools(sharding)[mask is not None]
@@ -101,6 +104,7 @@ class SamplingMetadata:
             "return_logprob": self.return_logprob,
             "top_logprobs_nums": self.top_logprobs_nums,
             "token_ids_logprobs": self.token_ids_logprobs,
+            "return_output_logprob_only": self.return_output_logprob_only,
         }
         return (children, aux_data)
 
@@ -124,6 +128,7 @@ class SamplingMetadata:
         obj.return_logprob = aux_data["return_logprob"]
         obj.top_logprobs_nums = aux_data["top_logprobs_nums"]
         obj.token_ids_logprobs = aux_data["token_ids_logprobs"]
+        obj.return_output_logprob_only = aux_data["return_output_logprob_only"]
 
         return obj
 
@@ -234,6 +239,7 @@ class SamplingMetadata:
         )
         return cls(
             return_logprob=batch.return_logprob,
+            return_output_logprob_only=bool(batch.return_output_logprob_only),
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
             temperatures=temperatures_device,
