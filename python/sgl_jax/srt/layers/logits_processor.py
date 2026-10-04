@@ -325,11 +325,21 @@ class LogitsProcessor(nnx.Module):
             "extend_input_logprob_token_ids_device must be populated when "
             "extend_return_logprob=True; got None"
         )
-        token_ids = token_ids.reshape((-1,))
-        row_ids = np.arange(input_logprobs.shape[0], dtype=np.int64)
-        out_sharding = NamedSharding(self.mesh, P(None))
-        selected = input_logprobs.at[(row_ids, token_ids)].get(out_sharding=out_sharding)
-        return selected.reshape((input_logprobs.shape[0],))
+        # Select each token's logprob on its vocab shard: compare the shard's
+        # vocab positions with the token ids and sum, so only a [tokens]
+        # reduction crosses devices. Gathering the [tokens, vocab] logprobs onto
+        # every device first made TT materialize them at 64 bytes per element
+        # (8.1 GB for a 512-token chunk of a 248k vocabulary).
+        logprobs_sharding = jax.typeof(input_logprobs).sharding
+        token_ids = jax.sharding.reshard(
+            token_ids.reshape((-1, 1)),
+            NamedSharding(self.mesh, P(*logprobs_sharding.spec[:1], None)),
+        )
+        positions = jax.lax.broadcasted_iota(
+            token_ids.dtype, input_logprobs.shape, 1, out_sharding=logprobs_sharding
+        )
+        selected = jnp.sum(jnp.where(positions == token_ids, input_logprobs, 0), axis=1)
+        return jax.sharding.reshard(selected, NamedSharding(self.mesh, P(None)))
 
     @named_scope
     def __call__(
