@@ -11,6 +11,7 @@ from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+from sgl_jax.srt.hardware_backend.tt import moe as tt_moe
 from sgl_jax.srt.kernels.gmm.megablox_gmm_backend import gmm
 from sgl_jax.srt.kernels.sparse_core.moe_permute import (
     moe_sc_permute_enabled_by_env,
@@ -59,7 +60,11 @@ class EPMoE(nnx.Module):
         self.physical_to_logical_map = physical_to_logical_map
         self.pre_gather_quant_dtype = pre_gather_quant_dtype
         self.moe_dp_size = moe_dp_size
-        self.replicate_experts = self.moe_dp_size > 1
+        # Megablox GMM doesn't run on TT; experts go through TTNN's sparse matmul.
+        # TT compiles a program for a single mesh, so the experts keep the
+        # replicated layout on the model mesh, split over "tensor".
+        self.use_tt_sparse_matmul = tt_moe.enabled()
+        self.replicate_experts = self.moe_dp_size > 1 or self.use_tt_sparse_matmul
 
         metadata = None if self.replicate_experts else get_global_expert_location_metadata()
         if metadata is not None and layer_id is not None:
@@ -634,6 +639,14 @@ class EPMoE(nnx.Module):
         *,
         scatter_on_tensor: bool = False,
     ):
+        if self.use_tt_sparse_matmul:
+            if self.activation != "silu":
+                raise NotImplementedError(f"MoE on TT doesn't support {self.activation}")
+            output = tt_moe.sparse_experts(
+                hidden_states, topk_weights, topk_ids, w0_weights, w1_weights, wo_weights
+            )
+            return self._reduce(output, scatter_on_tensor)
+
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
             if self.replicate_experts
@@ -690,7 +703,9 @@ class EPMoE(nnx.Module):
             topk_weights,
             valid_mask=valid_mask,
         )
+        return self._reduce(output, scatter_on_tensor)
 
+    def _reduce(self, output, scatter_on_tensor):
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
         # for SP layout on the token dim, AR (psum) otherwise. The matching
         # out_specs is set in __call__ from the same source of truth.
@@ -989,6 +1004,9 @@ def create_moe_weights_mapping(
             sharding = (
                 ("expert", "tensor", None) if target_name == "wo" else ("expert", None, "tensor")
             )
+            if tt_moe.enabled():
+                # Match EPMoE's replicated layout on the model mesh.
+                sharding = (None, *sharding[1:])
             transpose = True
         elif moe_backend in ("fused", "fused_v2"):
             # Fused MoE kernel shards experts across the full EP mesh, i.e. the

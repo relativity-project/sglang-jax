@@ -115,6 +115,7 @@ class ModelConfig:
         model_sub_dir: str | None = None,
         hf_config: PretrainedConfig | None = None,
         model_weights: str | None = None,
+        device: str | None = None,
     ) -> None:
         self.model_path = model_path
         self.model_weights = model_weights
@@ -164,12 +165,11 @@ class ModelConfig:
         # instead of dispatching on --moe-backend. Resolve the effective backend
         # to FUSED so downstream guards keyed on the backend string
         # (CompilationManager bs-bucket filter, tp_worker align_bs) see the
-        # actual kernel constraints.
-        if self.hf_config.architectures[
-            0
-        ] in _FORCED_FUSED_EP_MOE_ARCHS and self.moe_backend not in (
-            MoEBackend.FUSED,
-            MoEBackend.FUSED_V2,
+        # actual kernel constraints. TT runs their experts through EPMoE.
+        if (
+            self.hf_config.architectures[0] in _FORCED_FUSED_EP_MOE_ARCHS
+            and self.moe_backend not in (MoEBackend.FUSED, MoEBackend.FUSED_V2)
+            and device != "tt"
         ):
             logger.info(
                 "%s hard-codes FusedEPMoE; resolving effective moe_backend %s -> fused",
@@ -629,6 +629,7 @@ class ModelConfig:
             moe_backend=server_args.moe_backend,
             moe_dp_size=server_args.moe_dp_size,
             model_sub_dir=model_sub_dir,
+            device=server_args.device,
             **kwargs,
         )
 

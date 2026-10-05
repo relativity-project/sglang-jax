@@ -14,8 +14,9 @@ Key conventions confirmed against the upstream torch reference
 * Full attention has an output gate: ``q_proj`` emits ``2*num_heads*head_dim``;
   per head the layout is ``[q(head_dim) | gate(head_dim)]``; ``gate`` skips
   q_norm/RoPE and applies as ``sigmoid(gate)`` after attention.
-* MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` routed path,
-  plus a dense ``Qwen2MoeMLP`` shared expert gated by ``sigmoid(shared_gate)``.
+* MoE mirrors qwen2_moe: ``GateLogit`` + ``TopK`` + ``FusedEPMoE`` (``EPMoE``
+  on TT) routed path, plus a dense ``Qwen2MoeMLP`` shared expert gated by
+  ``sigmoid(shared_gate)``.
 * GDN fuses HF's 4 in-proj keys into 2 JAX projections
   (``in_proj_qkvz`` = [Q|K|V|Z], ``in_proj_ba`` = [B|A]) as
   ``MergedColumnParallelLinear``s, so each TP rank holds its own heads of each
@@ -38,6 +39,7 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.hardware_backend.tt import moe as tt_moe
 from sgl_jax.srt.layers.embeddings import Embed, MRotaryEmbedding, ParallelLMHead
 from sgl_jax.srt.layers.fused_moe import FusedEPMoE
 from sgl_jax.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -48,7 +50,7 @@ from sgl_jax.srt.layers.linear import (
     stripe_merged_weight,
 )
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
-from sgl_jax.srt.layers.moe import GateLogit, TopK
+from sgl_jax.srt.layers.moe import EPMoE, GateLogit, TopK
 from sgl_jax.srt.layers.radix_attention import RadixAttention
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.mem_cache.memory_pool import MemoryPools
@@ -375,19 +377,33 @@ class Qwen3_5MoeBlock(nnx.Module):
             layer_id=layer_id,
             mesh=mesh,
         )
-        self.experts = FusedEPMoE(
-            hidden_size=hidden,
-            num_experts=self.num_experts,
-            num_experts_per_tok=self.top_k,
-            ep_size=ep_size,
-            mesh=mesh,
-            intermediate_dim=inter,
-            weight_dtype=dtype,
-            dtype=dtype,
-            activation="silu",
-            layer_id=layer_id,
-            renormalize_topk_logits=renorm,
-        )
+        if tt_moe.enabled():
+            # The fused kernel is TPU-only; TT runs the experts through EPMoE.
+            self.experts = EPMoE(
+                hidden_size=hidden,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.top_k,
+                ep_size=ep_size,
+                mesh=mesh,
+                intermediate_dim=inter,
+                weight_dtype=dtype,
+                dtype=dtype,
+                layer_id=layer_id,
+            )
+        else:
+            self.experts = FusedEPMoE(
+                hidden_size=hidden,
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.top_k,
+                ep_size=ep_size,
+                mesh=mesh,
+                intermediate_dim=inter,
+                weight_dtype=dtype,
+                dtype=dtype,
+                activation="silu",
+                layer_id=layer_id,
+                renormalize_topk_logits=renorm,
+            )
         # Dense shared expert (always present for 35B-A3B) gated per-token.
         self.shared_experts = Qwen2MoeMLP(
             hidden_size=hidden,
@@ -978,15 +994,24 @@ def _create_qwen3_5_weight_mappings(hf_config, lm_head: ParallelLMHead | None = 
             sharding=(None, None),
             transpose=True,
         )
+        if tt_moe.enabled():
+            # EPMoE's layout: each expert's intermediate dim split over "tensor".
+            gate_up_targets = [f"{dst}.mlp.experts.wi_0", f"{dst}.mlp.experts.wi_1"]
+            down_target = f"{dst}.mlp.experts.wo"
+            gate_up_sharding, down_sharding = (None, None, "tensor"), (None, "tensor", None)
+        else:
+            gate_up_targets = [f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"]
+            down_target = f"{dst}.mlp.experts.w2"
+            gate_up_sharding = down_sharding = (("data", "tensor"), None, None)
         mappings[f"{src}.mlp.experts.gate_up_proj"] = WeightSpec(
-            target_path=[f"{dst}.mlp.experts.w1", f"{dst}.mlp.experts.w3"],
-            sharding=(("data", "tensor"), None, None),
+            target_path=gate_up_targets,
+            sharding=gate_up_sharding,
             transpose=False,
         )
         # HF down_proj [E, hidden, inter] -> w2 [E, inter, hidden] (transpose last 2).
         mappings[f"{src}.mlp.experts.down_proj"] = WeightSpec(
-            target_path=f"{dst}.mlp.experts.w2",
-            sharding=(("data", "tensor"), None, None),
+            target_path=down_target,
+            sharding=down_sharding,
             transpose=False,
             transpose_axes=(0, 2, 1),
         )
