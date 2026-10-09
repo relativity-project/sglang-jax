@@ -155,6 +155,7 @@ class CompilationManager:
         # "fused" so the bs-bucket filter below applies. Fall back to the raw
         # server_args string for callers that don't have a ModelConfig yet.
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
+        self.device = server_args.device
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
         # Backends may request decode variants per pages-per-seq bucket (MSA);
@@ -198,7 +199,9 @@ class CompilationManager:
 
     def _compute_bs_buckets(self, user_paddings: list[int] | None) -> list[int]:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
-        is_fused_moe = self.moe_backend in ("fused", "fused_v2")
+        # The TPU fused-MoE kernel needs at least 2 tokens per EP rank; TT runs
+        # FusedEPMoE through its own kernel, which doesn't.
+        is_fused_moe = self.moe_backend in ("fused", "fused_v2") and self.device != "tt"
         min_fused_bs = self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
@@ -315,7 +318,9 @@ class CompilationManager:
         # architectures that hard-code FusedEPMoE (e.g. Qwen3.5 MoE) are
         # covered even when the raw server_args string stays at "epmoe".
         mesh_ep_size = server_args.tp_size
-        if moe_backend in ("fused", "fused_v2") and mesh_ep_size > 1:
+        # TT runs FusedEPMoE through its own kernel, which has no batch constraints.
+        uses_tpu_kernel = moe_backend in ("fused", "fused_v2") and server_args.device != "tt"
+        if uses_tpu_kernel and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
             assert mesh_ep_size % dp_size == 0, (
