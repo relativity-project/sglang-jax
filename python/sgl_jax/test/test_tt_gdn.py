@@ -42,52 +42,44 @@ def tt_device():
 
 
 def test_weight_precision_policy(monkeypatch):
-    annotations = []
+    annotations = {}
 
     def annotate(value, dtype):
-        annotations.append((value.shape, dtype))
+        annotations[value.shape] = dtype
         return value
 
     monkeypatch.setattr(ops, "annotate_weight_dtype", annotate)
-    leaves = (
-        jnp.ones((128, 64), jnp.bfloat16),  # Projection weights.
-        jnp.ones((128,), jnp.float32),  # Decay, bias, and normalization parameters.
-        jnp.ones((), jnp.float32),
-        jnp.ones((32,), jnp.int32),
-    )
+    state = {
+        "self_attn": {
+            "q_proj": {"weight": jnp.ones((128, 64), jnp.bfloat16)},
+            "in_proj_ba": {"weight": jnp.ones((128, 65), jnp.bfloat16)},
+            "A_log": jnp.ones((128,), jnp.float32),  # Decay, bias, and normalization parameters.
+            "step": jnp.ones((), jnp.float32),
+        },
+        "mlp": {
+            "w1": jnp.ones((4, 64, 96), jnp.bfloat16),  # MoE experts.
+            "moe_gate": {"kernel": jnp.ones((64, 8), jnp.bfloat16)},  # Router gate.
+        },
+        "lm_head": {"embedding": jnp.ones((256, 64), jnp.bfloat16)},
+        "positions": jnp.ones((32,), jnp.int32),
+    }
     backend = HybridLinearAttnBackend(
         full_attn_backend=TTAttention.__new__(TTAttention),
         linear_attn_backend=TTGDNAttnBackend.__new__(TTGDNAttnBackend),
         full_attn_layers=[0],
     )
-    prepared = backend.prepare_model_state(leaves)
-    assert all(a is b for a, b in zip(prepared, leaves))
-    assert annotations == [((128, 64), "bfp_bf8"), ((128,), "bf16")]
+    prepared = backend.prepare_model_state(state)
+    assert prepared["self_attn"]["q_proj"]["weight"] is state["self_attn"]["q_proj"]["weight"]
+    assert annotations == {
+        (128, 64): "bfp_bf8",
+        (128, 65): "bfp_bf8",
+        (128,): "bf16",
+        (4, 64, 96): "bfp_bf8",
+        (64, 8): "bf16",
+        (256, 64): "bfp_bf8",
+    }
     # A global weight override could also affect unannotated recurrent matmuls.
     assert "experimental_weight_dtype" not in backend.compiler_options
-
-
-def test_router_gates_stay_bf16(monkeypatch):
-    annotations = []
-
-    def annotate(value, dtype):
-        annotations.append((value.shape, dtype))
-        return value
-
-    monkeypatch.setattr(ops, "annotate_weight_dtype", annotate)
-    state = {
-        "layers": {
-            0: {
-                "mlp": {
-                    "gate_proj": jnp.ones((64, 96), jnp.bfloat16),
-                    "moe_gate": {"kernel": jnp.ones((64, 8), jnp.bfloat16)},
-                },
-            },
-        },
-    }
-    leaves, treedef = jax.tree_util.tree_flatten(state)
-    TTAttention.__new__(TTAttention).prepare_model_state(leaves, treedef)
-    assert sorted(annotations) == [((64, 8), "bf16"), ((64, 96), "bfp_bf8")]
 
 
 def _repeat_heads(q, k, v):

@@ -218,9 +218,9 @@ class HybridLinearAttnBackend(AttentionBackend):
     def sampler_compiler_options(self):
         return getattr(self.full_attn_backend, "sampler_compiler_options", None)
 
-    def prepare_model_state(self, leaves, model_state_def=None):
+    def prepare_model_state(self, state):
         prepare = getattr(self.full_attn_backend, "prepare_model_state", None)
-        return prepare(leaves, model_state_def) if prepare is not None else leaves
+        return prepare(state) if prepare is not None else state
 
     @property
     def forward_metadata(self):

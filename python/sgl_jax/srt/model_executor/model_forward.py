@@ -37,10 +37,10 @@ def make_jitted_run_model(attn_backend, compiler_options=None):
         memory_pools,
         logits_metadata,
     ):
+        model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
         prepare_model_state = getattr(attn_backend, "prepare_model_state", None)
         if prepare_model_state is not None:
-            model_state_leaves = prepare_model_state(model_state_leaves, model_state_def)
-        model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model_state = prepare_model_state(model_state)
         model = nnx.merge(model_def, model_state)
         memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
         with LoraBatchContext.set_batch(forward_batch):

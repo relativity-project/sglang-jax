@@ -31,20 +31,14 @@ logger = logging.getLogger(__name__)
 MAX_DECODE_USERS = 32
 
 
-def prepare_weight(tensor, dtype=None):
-    if dtype is None:
-        dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
-    return tt_ops.annotate_weight_dtype(tensor, dtype)
-
-
-def _router_gate_leaves(model_state_def):
-    """Indices of the model state leaves under an MoE router gate (`moe_gate`)."""
-    tree = jax.tree_util.tree_unflatten(model_state_def, range(model_state_def.num_leaves))
-    return frozenset(
-        index
-        for path, index in jax.tree_util.tree_flatten_with_path(tree)[0]
-        if any(getattr(key, "key", None) == "moe_gate" for key in path)
+def _weight_dtype(path, weight):
+    """BFP8 for projection weights (attention, MLP, MoE experts, DFlash's fc and
+    the LM head), BF16 for the rest, such as norms and MoE router gates."""
+    names = [str(getattr(key, "key", "")) for key in path]
+    projection = any(
+        "proj" in name or name in ("w1", "w2", "w3", "fc", "lm_head") for name in names
     )
+    return "bfp_bf8" if projection and weight.ndim > 1 else "bf16"
 
 
 @register_pytree_node_class
@@ -189,20 +183,15 @@ class TTAttention(AttentionBackend):
         backend.forward_metadata = children[0]
         return backend
 
-    def prepare_model_state(self, leaves, model_state_def=None):
-        # MoE router gates stay BF16, as their checkpoints store them: BFP8
-        # would round the logits that choose each token's experts. The router
-        # dot casts both BF16 operands to f32 at the highest precision, which
-        # TT runs as an exact-product BF16 matmul with f32 accumulation.
-        gates = frozenset() if model_state_def is None else _router_gate_leaves(model_state_def)
-        return tuple(
-            (
-                prepare_weight(leaf, "bf16" if index in gates else None)
+    def prepare_model_state(self, state):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (
+                tt_ops.annotate_weight_dtype(leaf, _weight_dtype(path, leaf))
                 if getattr(leaf, "ndim", 0) > 0
                 and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
                 else leaf
-            )
-            for index, leaf in enumerate(leaves)
+            ),
+            state,
         )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
