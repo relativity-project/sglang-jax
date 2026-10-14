@@ -12,6 +12,8 @@ from numbers import Integral
 import jax.numpy as jnp
 import yaml
 
+from sgl_jax.srt.utils.quantization.block_float import BlockFloat
+
 # Map string dtype names to JAX numpy dtypes
 DTYPE_MAP = {
     "int8": jnp.int8,
@@ -19,6 +21,9 @@ DTYPE_MAP = {
     "float8_e5m2": jnp.float8_e5m2,
     "bfloat16": jnp.bfloat16,
     "float32": jnp.float32,
+    # Block floating point: stored by the device, see block_float.py.
+    "bfp_bf8": BlockFloat.BFP_BF8,
+    "bfp_bf4": BlockFloat.BFP_BF4,
     None: None,
 }
 
@@ -97,6 +102,8 @@ class QuantizationConfig:
         is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
         ignored_layers: Optional list of layer name patterns to exclude from quantization
         weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
+        moe_block_float: Block floating point format of the MoE expert weights
+        lm_head_block_float: Block floating point format of the LM head
     """
 
     linear_rules: list[dict] | None = None
@@ -106,6 +113,8 @@ class QuantizationConfig:
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
+    moe_block_float: BlockFloat | None = None
+    lm_head_block_float: BlockFloat | None = None
 
     def to_dict(self) -> dict:
         # Required by transformers.PretrainedConfig.to_json_string when this
@@ -125,6 +134,8 @@ class QuantizationConfig:
                 list(self.weight_block_size) if self.weight_block_size is not None else None
             ),
             "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+            "moe_block_float": self.moe_block_float,
+            "lm_head_block_float": self.lm_head_block_float,
         }
 
     @classmethod
@@ -178,6 +189,17 @@ class QuantizationConfig:
             )
         moe_weight_dtype = _str_to_dtype(moe_section.get("weight_dtype"))
         moe_activation_dtype = _str_to_dtype(moe_section.get("activation_dtype"))
+        # Block float experts keep their JAX dtype, so the MoE layers must not
+        # see them as quantized.
+        moe_block_float = None
+        if isinstance(moe_weight_dtype, BlockFloat):
+            moe_block_float, moe_weight_dtype = moe_weight_dtype, None
+        lm_head_block_float = _str_to_dtype(quant.get("lm_head", {}).get("weight_dtype"))
+        if lm_head_block_float is not None and not isinstance(lm_head_block_float, BlockFloat):
+            raise ValueError(
+                f"quantization.lm_head.weight_dtype in {resolved_path} must be a block "
+                f"floating point format ({', '.join(BlockFloat)}), got {lm_head_block_float}"
+            )
         is_static_checkpoint = quant.get("is_static_checkpoint", False)
         weight_block_size = normalize_weight_block_size(quant.get("weight_block_size"))
         allow_narrow_n_blockwise = quant.get("allow_narrow_n_blockwise", False)
@@ -190,6 +212,8 @@ class QuantizationConfig:
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             allow_narrow_n_blockwise=allow_narrow_n_blockwise,
+            moe_block_float=moe_block_float,
+            lm_head_block_float=lm_head_block_float,
         )
 
     @classmethod
@@ -220,7 +244,11 @@ class QuantizationConfig:
 
     def has_moe_quantization(self) -> bool:
         """Check if MoE quantization is configured."""
-        return self.moe_weight_dtype is not None or self.moe_activation_dtype is not None
+        return (
+            self.moe_weight_dtype is not None
+            or self.moe_activation_dtype is not None
+            or self.moe_block_float is not None
+        )
 
     def has_linear_quantization(self) -> bool:
         """Check if linear layer quantization is configured."""

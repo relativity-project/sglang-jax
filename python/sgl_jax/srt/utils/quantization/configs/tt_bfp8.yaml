@@ -1,0 +1,17 @@
+# Tenstorrent BFP8 weights: the default for --device tt.
+# Linear layers, MoE experts and the LM head keep BF16 values in JAX and are
+# stored as BFP8 (blocks of 16 values share one exponent) on device. Everything
+# else, such as MoE router gates (GateLogit), norms and embeddings, stays BF16.
+
+quantization:
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'bfp_bf8'
+
+  moe:
+    weight_dtype: 'bfp_bf8'
+    activation_dtype: null
+
+  lm_head:
+    weight_dtype: 'bfp_bf8'

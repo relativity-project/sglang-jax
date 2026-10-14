@@ -845,8 +845,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     dp_size=dp_size,
                 )
 
-            prepared = _prepare_model_state(runner, {"embed_tokens": embed, "lm_head": lm_head})
-            embed, lm_head = prepared["embed_tokens"], prepared["lm_head"]
+            embed, lm_head = _prepare_model_state(runner, (embed, lm_head))
             input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
             forward_batch.input_embedding = input_embedding
             model_state = _prepare_model_state(

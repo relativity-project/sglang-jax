@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import nnx
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
 from sgl_jax.srt.hardware_backend.tt.attention.gdn_backend import (
@@ -25,6 +26,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sgl_jax.srt.utils.quantization.block_float import BlockFloatWeight
 
 
 @pytest.fixture(autouse=True)
@@ -50,18 +52,12 @@ def test_weight_precision_policy(monkeypatch):
 
     monkeypatch.setattr(ops, "annotate_weight_dtype", annotate)
     state = {
-        "self_attn": {
-            "q_proj": {"weight": jnp.ones((128, 64), jnp.bfloat16)},
-            "in_proj_ba": {"weight": jnp.ones((128, 65), jnp.bfloat16)},
-            "A_log": jnp.ones((128,), jnp.float32),  # Decay, bias, and normalization parameters.
-            "step": jnp.ones((), jnp.float32),
-        },
-        "mlp": {
-            "w1": jnp.ones((4, 64, 96), jnp.bfloat16),  # MoE experts.
-            "moe_gate": {"kernel": jnp.ones((64, 8), jnp.bfloat16)},  # Router gate.
-        },
-        "lm_head": {"embedding": jnp.ones((256, 64), jnp.bfloat16)},
-        "positions": jnp.ones((32,), jnp.int32),
+        "q_proj": BlockFloatWeight(jnp.ones((128, 64), jnp.bfloat16), block_float="bfp_bf8"),
+        "experts": BlockFloatWeight(jnp.ones((4, 64, 96), jnp.bfloat16), block_float="bfp_bf4"),
+        "moe_gate": nnx.Param(jnp.ones((64, 8), jnp.bfloat16)),  # Router gate.
+        "A_log": nnx.Param(jnp.ones((128,), jnp.float32)),  # Decay, bias and norm parameters.
+        "step": nnx.Param(jnp.ones((), jnp.float32)),
+        "positions": nnx.Variable(jnp.ones((32,), jnp.int32)),
     }
     backend = HybridLinearAttnBackend(
         full_attn_backend=TTAttention.__new__(TTAttention),
@@ -69,17 +65,20 @@ def test_weight_precision_policy(monkeypatch):
         full_attn_layers=[0],
     )
     prepared = backend.prepare_model_state(state)
-    assert prepared["self_attn"]["q_proj"]["weight"] is state["self_attn"]["q_proj"]["weight"]
+    assert isinstance(prepared["q_proj"], BlockFloatWeight)
     assert annotations == {
         (128, 64): "bfp_bf8",
-        (128, 65): "bfp_bf8",
-        (128,): "bf16",
-        (4, 64, 96): "bfp_bf8",
+        (4, 64, 96): "bfp_bf4",
         (64, 8): "bf16",
-        (256, 64): "bfp_bf8",
+        (128,): "bf16",
     }
-    # A global weight override could also affect unannotated recurrent matmuls.
+    # DFlash passes the target's embedding and LM head as bare arrays.
+    annotations.clear()
+    backend.prepare_model_state((jnp.ones((256, 64), jnp.bfloat16),))
+    assert annotations == {(256, 64): "bfp_bf8"}
+    # A global weight override would also convert unannotated matmul weights.
     assert "experimental_weight_dtype" not in backend.compiler_options
+    assert "experimental_weight_dtype" not in TTAttention.compiler_options
 
 
 def _repeat_heads(q, k, v):

@@ -15,6 +15,7 @@ from sgl_jax.srt.configs.quantization_config import (
     DTYPE_MAP,
     normalize_weight_block_size,
 )
+from sgl_jax.srt.utils.quantization.block_float import BlockFloat, to_block_float
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,18 @@ def apply_quantization(model_config, model, *, is_static_input=False):
             model = apply_moe_quantization(model_config, model, is_static_input=is_static_input)
         if config.get_linear_rules():
             model = apply_linear_quantization(model_config, model, is_static_input=is_static_input)
+        if config.lm_head_block_float is not None:
+            model = apply_lm_head_block_float(model, config.lm_head_block_float)
+    return model
+
+
+def apply_lm_head_block_float(model: nnx.Module, block_float: BlockFloat) -> nnx.Module:
+    """Store the LM head weights in a block floating point format."""
+    from sgl_jax.srt.layers.embeddings import ParallelLMHead
+
+    heads = [node for _, node in nnx.iter_graph(model) if isinstance(node, ParallelLMHead)]
+    for head in heads:
+        head.embedding = to_block_float(head.embedding, block_float)
     return model
 
 
@@ -201,7 +214,10 @@ def apply_linear_quantization(
                         continue
 
                     rule = _find_matching_rule(child_path)
-                    if rule is not None:
+                    if rule is not None and isinstance(rule["weight_dtype"], BlockFloat):
+                        # The weight keeps its dtype in JAX; the device stores it.
+                        attr_value.weight = to_block_float(attr_value.weight, rule["weight_dtype"])
+                    elif rule is not None:
                         logger.debug(
                             "Quantizing %s with weight_dtype=%s, activation_dtype=%s",
                             child_path,
@@ -293,6 +309,13 @@ def apply_moe_quantization(
                 logger.info("Skipping MoE quantization for %s (matched ignored_layers)", log_path)
                 return
             logger.debug("Quantizing MoE weights path=%s", log_path)
+            if quant_config.moe_block_float is not None:
+                # The expert weights keep their dtype in JAX; the device stores them.
+                for name in ("w1", "w2", "w3", "wi_0", "wi_1", "wo"):
+                    weight = getattr(obj, name, None)
+                    if isinstance(weight, nnx.Param):
+                        setattr(obj, name, to_block_float(weight, quant_config.moe_block_float))
+                return
             obj.quantize_weights(
                 is_static=is_static_input,
                 abstract=getattr(model_config, "_abstract_mode", False),

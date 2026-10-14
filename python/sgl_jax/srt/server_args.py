@@ -401,6 +401,10 @@ class ServerArgs:
             else:
                 self.device = "tpu"
 
+        # Tenstorrent stores linear and MoE weights as BFP8 unless configured otherwise.
+        if self.device == "tt" and self.quantization_config_path is None:
+            self.quantization_config_path = "tt_bfp8.yaml"
+
         if self.served_model_name is None:
             self.served_model_name = self.model_path
 

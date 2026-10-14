@@ -23,6 +23,7 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch, ForwardM
 from sgl_jax.srt.utils import cdiv
 from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
+from sgl_jax.srt.utils.quantization.block_float import BlockFloatWeight
 
 logger = logging.getLogger(__name__)
 
@@ -31,14 +32,24 @@ logger = logging.getLogger(__name__)
 MAX_DECODE_USERS = 32
 
 
-def _weight_dtype(path, weight):
-    """BFP8 for projection weights (attention, MLP, MoE experts, DFlash's fc and
-    the LM head), BF16 for the rest, such as norms and MoE router gates."""
-    names = [str(getattr(key, "key", "")) for key in path]
-    projection = any(
-        "proj" in name or name in ("w1", "w2", "w3", "fc", "lm_head") for name in names
-    )
-    return "bfp_bf8" if projection and weight.ndim > 1 else "bf16"
+def _mark_weight(weight):
+    """Mark a weight for libtt: a parameter, in its block floating point format
+    if it has one (see the tt_bfp8.yaml quantization config), else BF16."""
+    value = weight.value if isinstance(weight, nnx.Variable) else weight
+    if getattr(value, "ndim", 0) == 0 or getattr(value, "dtype", None) not in (
+        jnp.bfloat16,
+        jnp.float32,
+    ):
+        return weight
+    if isinstance(weight, BlockFloatWeight):
+        dtype = weight.get_metadata()["block_float"]
+    elif isinstance(weight, nnx.Variable):
+        dtype = "bf16"
+    else:
+        # DFlash passes the target's embedding and LM head as bare arrays.
+        dtype = "bfp_bf8" if value.ndim > 1 else "bf16"
+    marked = tt_ops.annotate_weight_dtype(value, dtype)
+    return weight.replace(marked) if isinstance(weight, nnx.Variable) else marked
 
 
 @register_pytree_node_class
@@ -157,7 +168,6 @@ class TTAttention(AttentionBackend):
     compiler_options = {
         "experimental_enable_permute_matmul_fusion": "true",
         "optimization_level": "O1",
-        "experimental_weight_dtype": "bfp_bf8",
         "enable_trace": "true",
     }
     sampler_compiler_options = {"enable_trace": "true"}
@@ -184,15 +194,7 @@ class TTAttention(AttentionBackend):
         return backend
 
     def prepare_model_state(self, state):
-        return jax.tree_util.tree_map_with_path(
-            lambda path, leaf: (
-                tt_ops.annotate_weight_dtype(leaf, _weight_dtype(path, leaf))
-                if getattr(leaf, "ndim", 0) > 0
-                and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
-                else leaf
-            ),
-            state,
-        )
+        return jax.tree.map(_mark_weight, state, is_leaf=lambda x: isinstance(x, nnx.Variable))
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
         if batch.forward_mode == ForwardMode.EXTEND:
