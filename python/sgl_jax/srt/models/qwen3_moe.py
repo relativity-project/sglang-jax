@@ -218,6 +218,9 @@ class QWen3MoeDecoderLayer(nnx.Module):
                 input_size=config.hidden_size,
                 num_experts=num_experts,
                 weight_dtype=dtype,
+                # Qwen3-MoE checkpoints ship the gate in BF16; the router dot
+                # still runs in f32 at the highest precision.
+                kernel_dtype=jnp.bfloat16,
             )
 
             self.topk = TopK(

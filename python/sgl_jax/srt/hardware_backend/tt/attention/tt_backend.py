@@ -31,9 +31,20 @@ logger = logging.getLogger(__name__)
 MAX_DECODE_USERS = 32
 
 
-def prepare_weight(tensor):
-    dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
+def prepare_weight(tensor, dtype=None):
+    if dtype is None:
+        dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
     return tt_ops.annotate_weight_dtype(tensor, dtype)
+
+
+def _router_gate_leaves(model_state_def):
+    """Indices of the model state leaves under an MoE router gate (`moe_gate`)."""
+    tree = jax.tree_util.tree_unflatten(model_state_def, range(model_state_def.num_leaves))
+    return frozenset(
+        index
+        for path, index in jax.tree_util.tree_flatten_with_path(tree)[0]
+        if any(getattr(key, "key", None) == "moe_gate" for key in path)
+    )
 
 
 @register_pytree_node_class
@@ -178,15 +189,20 @@ class TTAttention(AttentionBackend):
         backend.forward_metadata = children[0]
         return backend
 
-    def prepare_model_state(self, leaves):
+    def prepare_model_state(self, leaves, model_state_def=None):
+        # MoE router gates stay BF16, as their checkpoints store them: BFP8
+        # would round the logits that choose each token's experts. The router
+        # dot casts both BF16 operands to f32 at the highest precision, which
+        # TT runs as an exact-product BF16 matmul with f32 accumulation.
+        gates = frozenset() if model_state_def is None else _router_gate_leaves(model_state_def)
         return tuple(
             (
-                prepare_weight(leaf)
+                prepare_weight(leaf, "bf16" if index in gates else None)
                 if getattr(leaf, "ndim", 0) > 0
                 and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
                 else leaf
             )
-            for leaf in leaves
+            for index, leaf in enumerate(leaves)
         )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):

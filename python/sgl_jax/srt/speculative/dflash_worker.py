@@ -41,10 +41,10 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
-def _prepare_model_state(runner, leaves):
+def _prepare_model_state(runner, leaves, model_state_def=None):
     """Apply the attention backend's in-JIT weight preparation, if any."""
     prepare = getattr(runner.attn_backend, "prepare_model_state", None)
-    return leaves if prepare is None else prepare(leaves)
+    return leaves if prepare is None else prepare(leaves, model_state_def)
 
 
 @dataclass(frozen=True)
@@ -846,7 +846,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 )
 
             embed, lm_head = _prepare_model_state(runner, (embed, lm_head))
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
+            model_state_leaves = _prepare_model_state(runner, model_state_leaves, model_state_def)
             input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
             forward_batch.input_embedding = input_embedding
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
@@ -982,7 +982,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     page_size=page_size,
                     dp_size=dp_size,
                 )
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
+            model_state_leaves = _prepare_model_state(runner, model_state_leaves, model_state_def)
             model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
@@ -1152,7 +1152,7 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 active_mask,
             )
 
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
+            model_state_leaves = _prepare_model_state(runner, model_state_leaves, model_state_def)
             state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
             model = nnx.merge(model_def, state)
             kv_list = model.materialize_kv(target_hidden, positions)

@@ -67,6 +67,29 @@ def test_weight_precision_policy(monkeypatch):
     assert "experimental_weight_dtype" not in backend.compiler_options
 
 
+def test_router_gates_stay_bf16(monkeypatch):
+    annotations = []
+
+    def annotate(value, dtype):
+        annotations.append((value.shape, dtype))
+        return value
+
+    monkeypatch.setattr(ops, "annotate_weight_dtype", annotate)
+    state = {
+        "layers": {
+            0: {
+                "mlp": {
+                    "gate_proj": jnp.ones((64, 96), jnp.bfloat16),
+                    "moe_gate": {"kernel": jnp.ones((64, 8), jnp.bfloat16)},
+                },
+            },
+        },
+    }
+    leaves, treedef = jax.tree_util.tree_flatten(state)
+    TTAttention.__new__(TTAttention).prepare_model_state(leaves, treedef)
+    assert sorted(annotations) == [((64, 8), "bf16"), ((64, 96), "bfp_bf8")]
+
+
 def _repeat_heads(q, k, v):
     # Like the TT kernels, each q/k head serves its group of value heads.
     group = v.shape[-2] // q.shape[-2]
