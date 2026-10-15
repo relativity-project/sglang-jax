@@ -5,7 +5,6 @@ reference to a correlation of about 0.98.
 """
 
 import os
-from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
@@ -19,10 +18,9 @@ from sgl_jax.srt.layers import fused_moe
 
 # Decode sizes and a prefill.
 @pytest.mark.parametrize("tokens", [1, 3, 45, 70])
-def test_experts(monkeypatch, tokens):
+def test_experts(tokens):
     if "tt" not in os.environ.get("JAX_PLATFORMS", "").split(","):
         pytest.skip("requires JAX_PLATFORMS=tt,cpu and a Tenstorrent device")
-    monkeypatch.setattr(fused_moe, "get_global_server_args", lambda: SimpleNamespace(device="tt"))
     hidden, intermediate, experts, k = 256, 256, 16, 4
     devices = np.array(jax.devices("tt"))
     mesh = jax.sharding.Mesh(

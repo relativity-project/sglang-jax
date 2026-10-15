@@ -6,10 +6,7 @@ from jax import numpy as jnp
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.eplb.expert_location import (
-    get_global_expert_location_metadata,
-    get_global_server_args,
-)
+from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
 
@@ -486,7 +483,7 @@ class FusedEPMoE(nnx.Module):
     ) -> jax.Array:
         """Forward pass through the fused MoE layer."""
         assert hidden_states.ndim == 2
-        if getattr(get_global_server_args(), "device", None) == "tt":
+        if self.mesh.devices.flat[0].platform == "tt":
             from sgl_jax.srt.hardware_backend.tt.fused_moe import fused_ep_moe as tt_fused_ep_moe
 
             return tt_fused_ep_moe(self, hidden_states, topk_weights, topk_ids, out_sharding)

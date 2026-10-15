@@ -10,6 +10,7 @@ from contextlib import nullcontext
 from contextvars import copy_context
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 from tqdm import tqdm
 
@@ -155,7 +156,6 @@ class CompilationManager:
         # "fused" so the bs-bucket filter below applies. Fall back to the raw
         # server_args string for callers that don't have a ModelConfig yet.
         self.moe_backend = moe_backend if moe_backend is not None else server_args.moe_backend
-        self.device = server_args.device
         self.enable_static_lora = server_args.enable_static_lora
         self.precompile_num_threads = server_args.precompile_num_threads
         # Backends may request decode variants per pages-per-seq bucket (MSA);
@@ -201,7 +201,9 @@ class CompilationManager:
         bs_list = user_paddings if user_paddings is not None else PRECOMPILE_DEFAULT_BS_PADDINGS
         # The TPU fused-MoE kernel needs at least 2 tokens per EP rank; TT runs
         # FusedEPMoE through its own kernel, which doesn't.
-        is_fused_moe = self.moe_backend in ("fused", "fused_v2") and self.device != "tt"
+        is_fused_moe = (
+            self.moe_backend in ("fused", "fused_v2") and jax.devices()[0].platform != "tt"
+        )
         min_fused_bs = self.tp_size * 2
         if is_fused_moe and self.max_padded_batch_size < min_fused_bs:
             raise ValueError(
@@ -319,7 +321,7 @@ class CompilationManager:
         # covered even when the raw server_args string stays at "epmoe".
         mesh_ep_size = server_args.tp_size
         # TT runs FusedEPMoE through its own kernel, which has no batch constraints.
-        uses_tpu_kernel = moe_backend in ("fused", "fused_v2") and server_args.device != "tt"
+        uses_tpu_kernel = moe_backend in ("fused", "fused_v2") and jax.devices()[0].platform != "tt"
         if uses_tpu_kernel and mesh_ep_size > 1:
             from sgl_jax.srt.utils.common_utils import align_bs_for_fused_ep
 
