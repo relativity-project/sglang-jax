@@ -41,10 +41,10 @@ from sgl_jax.srt.speculative.spec_info import SpeculativeAlgorithm
 logger = logging.getLogger(__name__)
 
 
-def _prepare_model_state(runner, leaves):
+def _prepare_model_state(runner, state):
     """Apply the attention backend's in-JIT weight preparation, if any."""
     prepare = getattr(runner.attn_backend, "prepare_model_state", None)
-    return leaves if prepare is None else prepare(leaves)
+    return state if prepare is None else prepare(state)
 
 
 @dataclass(frozen=True)
@@ -845,11 +845,13 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     dp_size=dp_size,
                 )
 
-            embed, lm_head = _prepare_model_state(runner, (embed, lm_head))
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
+            prepared = _prepare_model_state(runner, {"embed_tokens": embed, "lm_head": lm_head})
+            embed, lm_head = prepared["embed_tokens"], prepared["lm_head"]
             input_embedding = embed.at[forward_batch.input_ids].get(out_sharding=embedding_sharding)
             forward_batch.input_embedding = input_embedding
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model_state = _prepare_model_state(
+                runner, jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            )
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
@@ -982,8 +984,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                     page_size=page_size,
                     dp_size=dp_size,
                 )
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
-            model_state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            model_state = _prepare_model_state(
+                runner, jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            )
             model = nnx.merge(model_def, model_state)
             memory_pools = _maybe_apply_recurrent_cow(forward_batch, memory_pools)
             with LoraBatchContext.set_batch(forward_batch):
@@ -1152,8 +1155,9 @@ class DFlashWorker(BaseSpecWorker, BaseDraftWorker):
                 active_mask,
             )
 
-            model_state_leaves = _prepare_model_state(runner, model_state_leaves)
-            state = jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            state = _prepare_model_state(
+                runner, jax.tree_util.tree_unflatten(model_state_def, model_state_leaves)
+            )
             model = nnx.merge(model_def, state)
             kv_list = model.materialize_kv(target_hidden, positions)
             for i, (k, v) in enumerate(kv_list):

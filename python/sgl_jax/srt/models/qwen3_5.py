@@ -368,6 +368,9 @@ class Qwen3_5MoeBlock(nnx.Module):
             input_size=hidden,
             num_experts=self.num_experts,
             weight_dtype=dtype,
+            # Qwen3.5-MoE checkpoints ship the gate in BF16; the router dot
+            # still runs in f32 at the highest precision.
+            kernel_dtype=jnp.bfloat16,
         )
         self.topk = TopK(
             topk=self.top_k,

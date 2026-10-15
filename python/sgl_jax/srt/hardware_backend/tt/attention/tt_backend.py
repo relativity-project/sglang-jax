@@ -31,9 +31,14 @@ logger = logging.getLogger(__name__)
 MAX_DECODE_USERS = 32
 
 
-def prepare_weight(tensor):
-    dtype = "bf16" if tensor.ndim == 1 else "bfp_bf8"
-    return tt_ops.annotate_weight_dtype(tensor, dtype)
+def _weight_dtype(path, weight):
+    """BFP8 for projection weights (attention, MLP, MoE experts, DFlash's fc and
+    the LM head), BF16 for the rest, such as norms and MoE router gates."""
+    names = [str(getattr(key, "key", "")) for key in path]
+    projection = any(
+        "proj" in name or name in ("w1", "w2", "w3", "fc", "lm_head") for name in names
+    )
+    return "bfp_bf8" if projection and weight.ndim > 1 else "bf16"
 
 
 @register_pytree_node_class
@@ -178,15 +183,15 @@ class TTAttention(AttentionBackend):
         backend.forward_metadata = children[0]
         return backend
 
-    def prepare_model_state(self, leaves):
-        return tuple(
-            (
-                prepare_weight(leaf)
+    def prepare_model_state(self, state):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (
+                tt_ops.annotate_weight_dtype(leaf, _weight_dtype(path, leaf))
                 if getattr(leaf, "ndim", 0) > 0
                 and getattr(leaf, "dtype", None) in (jnp.bfloat16, jnp.float32)
                 else leaf
-            )
-            for leaf in leaves
+            ),
+            state,
         )
 
     def get_forward_metadata(self, batch: ModelWorkerBatch):
