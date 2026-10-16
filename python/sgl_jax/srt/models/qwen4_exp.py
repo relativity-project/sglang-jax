@@ -600,6 +600,10 @@ def _create_qwen4_exp_weight_mappings(hf_config, lm_head: ParallelLMHead | None 
         mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\.ple_embedding\."]
     else:
         mtp_skip = [*mtp_skip, r"^model\.language_model\.layers\.\d+\.ple\."]
+    # A config overridden to fewer layers than the checkpoint (a smoke test)
+    # leaves the deeper layers unread.
+    kept = "|".join(str(i) for i in range(num_layers))
+    mtp_skip = [*mtp_skip, rf"^model\.language_model\.layers\.(?!(?:{kept})\.)\d+\."]
     return mappings, visual_skip, mtp_skip
 
 
