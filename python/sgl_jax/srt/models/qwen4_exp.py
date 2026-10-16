@@ -18,6 +18,9 @@ What differs:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -25,6 +28,7 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 from transformers import PretrainedConfig
 
+from sgl_jax.srt.environ import envs
 from sgl_jax.srt.layers.attention.qsa_indexer import QSAIndexer
 from sgl_jax.srt.layers.embeddings import (
     Embed,
@@ -651,8 +655,21 @@ def _install_ngram_table(model_config) -> None:
     weight_files = {
         name: infos[0]["file"] for name, infos in LocalSource(model_config).metadata.items()
     }
-    set_ngram_table(
-        NGramTable.from_safetensors(
-            weight_files, tc, prefix=f"model.language_model.layers.{layers[0]}.ple.ple_embedding"
-        )
-    )
+    prefix = f"model.language_model.layers.{layers[0]}.ple.ple_embedding"
+    cache = envs.SGLANG_JAX_NGRAM_TABLE_CACHE.get()
+    if cache and (Path(cache) / "ngram_table.json").exists():
+        table = NGramTable.from_cache(cache)
+        # A cache written from another checkpoint would read valid but wrong rows.
+        table.verify_against_checkpoint(weight_files, prefix=prefix)
+        set_ngram_table(table)
+        return
+    table = NGramTable.from_safetensors(weight_files, tc, prefix=prefix)
+    if cache:
+        # Write the data first: the json sidecar marks the cache complete.
+        Path(cache).mkdir(parents=True, exist_ok=True)
+        with open(Path(cache) / "ngram_table.bin", "wb") as f:
+            table.write_to(f)
+        (Path(cache) / "ngram_table.json").write_text(json.dumps(table.metadata()))
+        del table
+        table = NGramTable.from_cache(cache)
+    set_ngram_table(table)
