@@ -115,6 +115,10 @@ class HostWeightCache:
                 f.write(host.tobytes())
                 shards[name] = {"bounds": bounds, "shape": list(host.shape), "offset": offset}
                 offset += host.nbytes
+            # Write back now: a whole model's worth of dirty pages (~250 GB for
+            # Flash-Next) stalls reclaim, and systemd-oomd acts on that pressure.
+            f.flush()
+            os.fsync(f.fileno())
         meta = {
             "shape": list(value.shape),
             "dtype": dtype.name,
