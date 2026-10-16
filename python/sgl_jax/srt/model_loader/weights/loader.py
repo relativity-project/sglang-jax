@@ -19,6 +19,7 @@ from tqdm import tqdm
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 
+from .host_cache import HostWeightCache
 from .reader import JaxShardReader, WeightReader
 from .recipes import TensorLayout
 from .source import (
@@ -239,15 +240,34 @@ class WeightLoader:
         if budget <= 0:
             raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
         warned_oversized = False
+        host_cache = self._host_cache()
         try:
             for name, spec in tqdm(active, desc="Loading weights"):
                 oversized = False
+                targets = (
+                    (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
+                )
+                cache_keys = cached = None
+                if host_cache is not None:
+                    identity = self._spec_identity(spec)
+                    cache_keys = [
+                        host_cache.key(identity, path, expected)
+                        for path, expected in zip(targets, schemas[name])
+                    ]
+                    cached = [
+                        host_cache.load(key, expected)
+                        for key, expected in zip(cache_keys, schemas[name])
+                    ]
+                    if any(value is None for value in cached):
+                        cached = None
                 if pending_owners and spec.recipe is None:
                     # Reader groups manage their own scratch space and wait for
                     # local uploads. Release preceding recipe inputs first.
                     jax.block_until_ready(pending)
                     pending, pending_owners, pending_bytes = [], [], 0
-                if spec.host_recipe is not None:
+                if cached is not None:
+                    outputs = cached
+                elif spec.host_recipe is not None:
                     outputs = self.reader.read_host_group(
                         self.source, spec, schemas[name], self._sharding(spec)
                     )
@@ -288,13 +308,12 @@ class WeightLoader:
                     outputs = self._load_experts(params, name, spec)
                 else:
                     outputs = self._load_tensor(params, name, spec)
-                targets = (
-                    (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
-                )
                 values = list(outputs)
-                pending.extend(values)
                 if len(values) != len(targets):
                     raise ValueError(f"Recipe output count mismatch: {name}")
+                if cache_keys is not None and cached is None:
+                    values = [host_cache.store(k, v) for k, v in zip(cache_keys, values)]
+                pending.extend(values)
                 for path, value, expected in zip(targets, values, schemas[name]):
                     self._assign(self._get_param(params, path), value, expected, path)
                 pending_bytes += sum(
@@ -326,7 +345,22 @@ class WeightLoader:
             "unexpected": tuple(unexpected),
         }
         logger.info("Loaded %d parameters in %.2fs", len(writers), report["seconds"])
+        if host_cache is not None:
+            logger.info(
+                "Host weight cache %s: %d mapped, %d written",
+                host_cache.directory,
+                host_cache.hits,
+                host_cache.writes,
+            )
         return report
+
+    def _host_cache(self):
+        """File-backed parameters (host_cache.py), when SGLANG_JAX_HOST_WEIGHT_CACHE
+        names a directory. Single-process only: the files are not shared."""
+        directory = os.environ.get("SGLANG_JAX_HOST_WEIGHT_CACHE")
+        if not directory or jax.process_count() > 1:
+            return None
+        return HostWeightCache(directory, self.source.identity, self.mesh)
 
     @staticmethod
     def _spec_identity(spec):
