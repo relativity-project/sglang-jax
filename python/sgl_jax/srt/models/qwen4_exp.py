@@ -19,6 +19,7 @@ What differs:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import jax
@@ -52,6 +53,9 @@ from sgl_jax.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
     _create_qwen3_5_weight_mappings,
 )
+
+logger = logging.getLogger(__name__)
+_warned_dense_qsa = False
 
 
 class Qwen4ExpAttention(nnx.Module):
@@ -180,7 +184,20 @@ class Qwen4ExpAttention(nnx.Module):
         backend = forward_batch.attn_backend
         backend = getattr(backend, "full_attn_backend", backend)
         slot_map = getattr(backend, "full_slot", None)
-        if slot_map is None or self.layer_id not in slot_map:
+        if slot_map is None:
+            global _warned_dense_qsa
+            if not _warned_dense_qsa:
+                _warned_dense_qsa = True
+                limit = self.indexer.budget + self.indexer.compress_ratio - 1
+                logger.warning(
+                    "%s has no QSA support, so the QSA layers attend densely. That "
+                    "matches the model only while a request's context is at most %d "
+                    "tokens (indexer_budget + indexer_compress_ratio - 1).",
+                    type(backend).__name__,
+                    limit,
+                )
+            return None
+        if self.layer_id not in slot_map:
             return None
         indexer_q, raw_key = self.indexer.project(
             hidden_states, forward_batch.positions, self.indexer_rotary_emb
