@@ -251,7 +251,7 @@ class WeightLoader:
                 if host_cache is not None:
                     identity = self._spec_identity(spec)
                     cache_keys = [
-                        host_cache.key(identity, path, expected)
+                        host_cache.key(identity, path, expected, group_files[name])
                         for path, expected in zip(targets, schemas[name])
                     ]
                     cached = [
@@ -360,7 +360,7 @@ class WeightLoader:
         directory = os.environ.get("SGLANG_JAX_HOST_WEIGHT_CACHE")
         if not directory or jax.process_count() > 1:
             return None
-        return HostWeightCache(directory, self.source.identity, self.mesh)
+        return HostWeightCache(directory, self.mesh)
 
     @staticmethod
     def _spec_identity(spec):

@@ -94,7 +94,12 @@ def _worker(root):
     for name in ("w", "norm", "experts"):
         assert getattr(second, name)[...].sharding == getattr(first, name)[...].sharding, name
 
-    # A rewritten checkpoint changes its identity: the cache must not be used.
+    # A file added elsewhere in the checkpoint (a download still running)
+    # leaves the entries of the files they were read from valid.
+    save_file({"later": tensors["w"]}, checkpoint / "model-later.safetensors")
+    load(fail_reads=True)
+
+    # A rewritten file changes its stat: the cache must not be used.
     tensors["w"] = tensors["w"] + 1
     save_file(tensors, checkpoint / "model.safetensors")
     load()

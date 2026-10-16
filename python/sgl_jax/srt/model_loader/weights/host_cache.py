@@ -10,9 +10,10 @@ of copying them, so a parameter written once, shard by shard, to a cache
 directory lives in clean page cache the kernel can evict and read back. Later
 launches map the files directly and skip the checkpoint and its recipes.
 
-The key covers the checkpoint files (size, mtime, inode), the mapping spec,
-the target and the mesh, but not the loader's code: clear the directory after
-changing a recipe.
+The key covers the checkpoint files a parameter reads (size, mtime, inode),
+the mapping spec, the target and the mesh, but not the loader's code: clear
+the directory after changing a recipe. Entries for replaced files are not
+removed.
 """
 
 from __future__ import annotations
@@ -48,16 +49,22 @@ def _spec_from_json(axes):
 
 
 class HostWeightCache:
-    def __init__(self, directory: str | os.PathLike, source_identity: str, mesh):
+    def __init__(self, directory: str | os.PathLike, mesh):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.source_identity = source_identity
         self.mesh = mesh
         self.hits = self.writes = 0
 
-    def key(self, spec_identity: str, path: str, expected) -> str:
+    def key(self, spec_identity: str, path: str, expected, files) -> str:
+        """``files`` are the checkpoint files the parameter is read from. Only
+        their stat enters the key, so files added or replaced elsewhere in the
+        checkpoint (a download still running) keep the other entries valid."""
+        signature = sorted(
+            (str(name), (stat := os.stat(name)).st_size, stat.st_mtime_ns, stat.st_ino)
+            for name in files
+        )
         description = [
-            self.source_identity,
+            signature,
             spec_identity,
             path,
             list(expected.shape),
