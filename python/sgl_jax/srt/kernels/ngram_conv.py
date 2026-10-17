@@ -24,21 +24,6 @@ def _initial_state(pool, slots, has_initial_state, channels, kernel, dilation):
     return pool, state
 
 
-def _depthwise(window, weight, dtype, *, channel_axis):
-    """sum_k window[..., k] * weight[c, k] -> window.shape[:-1], accumulated in
-    FP32 and rounded once, as the einsum it replaces. Written as one
-    multiply-add per tap: as an einsum, the contraction over k is a batched
-    matmul over every channel, which TT runs as one padded tile product per
-    channel (3.1 ms per decode step for 2560 channels)."""
-    shape = [1] * (window.ndim - 1)
-    shape[channel_axis] = weight.shape[0]
-    total = None
-    for k in range(weight.shape[1]):
-        term = window[..., k].astype(jnp.float32) * weight[:, k].astype(jnp.float32).reshape(shape)
-        total = term if total is None else total + term
-    return total.astype(dtype)
-
-
 def _write_state(pool, slots, state):
     # Drop dummy-slot updates, including repeated zeros in a padded batch.
     indices = jnp.where(slots == 0, pool.shape[0], slots)
@@ -82,7 +67,7 @@ def ngram_conv_prefill(
         prior_idx = jnp.clip(state_len + position, 0, state_len - 1)
         prior = state[seq[:, None], :, prior_idx].transpose(2, 0, 1)
         window = jnp.where(position[None] >= 0, window, prior)
-    y = jax.nn.silu(_depthwise(window, weight[:, ::-1], x.dtype, channel_axis=0))
+    y = jax.nn.silu(jnp.einsum("ctk,ck->ct", window, weight[:, ::-1].astype(x.dtype)))
 
     if state_len:
         position = lengths[:, None] - state_len + jnp.arange(state_len)[None, :]
@@ -118,7 +103,7 @@ def ngram_conv_update(
         conv_state, state_indices, has_initial_state, channels, weight.shape[1], dilation
     )
     window = jnp.concatenate([state, x[..., None]], axis=-1)
-    y = jax.nn.silu(_depthwise(window[..., ::dilation], weight, x.dtype, channel_axis=1))
+    y = jax.nn.silu(jnp.einsum("bck,ck->bc", window[..., ::dilation], weight.astype(x.dtype)))
     updated = _write_state(pool, state_indices, window[..., 1:])
     if track_indices is not None:
         updated = _scatter_track(updated, track_indices, track_mask, window[..., 1:])
