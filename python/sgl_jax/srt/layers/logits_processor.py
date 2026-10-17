@@ -325,14 +325,11 @@ class LogitsProcessor(nnx.Module):
             "extend_input_logprob_token_ids_device must be populated when "
             "extend_return_logprob=True; got None"
         )
-        token_ids = token_ids.reshape((-1, 1))
-        # One masked row sum, not a gather: TT lowers this gather by flattening
-        # the [tokens, vocab] logprobs to [tokens * vocab, 1], which its 32-wide
-        # tiles pad 32-fold (8 GB for a 512-token prefill over a 248k vocab).
-        # Each row has one nonzero term, so the sum is exact.
-        vocab = jax.lax.broadcasted_iota(token_ids.dtype, (1, input_logprobs.shape[1]), 1)
-        selected = jnp.sum(jnp.where(vocab == token_ids, input_logprobs, 0), axis=1)
-        return jax.sharding.reshard(selected, NamedSharding(self.mesh, P(None)))
+        token_ids = token_ids.reshape((-1,))
+        row_ids = np.arange(input_logprobs.shape[0], dtype=np.int64)
+        out_sharding = NamedSharding(self.mesh, P(None))
+        selected = input_logprobs.at[(row_ids, token_ids)].get(out_sharding=out_sharding)
+        return selected.reshape((input_logprobs.shape[0],))
 
     @named_scope
     def __call__(
