@@ -39,6 +39,11 @@ class EnvBool(EnvField):
         raise ValueError(f"Invalid boolean value for {self.name}: {value!r}")
 
 
+class EnvStr(EnvField):
+    def parse(self, value: str) -> str:
+        return value
+
+
 class Envs:
     # Compute the GPT-J (interleaved) rotary embedding directly in the
     # interleaved domain instead of strided even/odd slices plus a
@@ -49,6 +54,11 @@ class Envs:
     # concatenate instead of a read-modify-write ``at[...].set``. Values are
     # identical; escape hatch only.
     SGLANG_JAX_INDEXER_ROPE_CONCAT = EnvBool(True)
+
+    # Directory of a memory-mapped copy of the Qwen4Exp N-gram table. The
+    # first launch writes it from the checkpoint; later ones map it instead of
+    # reading ~95 GiB of shards into RAM, and processes share its pages.
+    SGLANG_JAX_NGRAM_TABLE_CACHE = EnvStr("")
 
 
 envs = Envs()
