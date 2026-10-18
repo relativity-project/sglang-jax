@@ -637,7 +637,7 @@ def _ple_mappings(src: str, dst: str, text_cfg) -> dict:
 
 
 def _install_ngram_table(model_config) -> None:
-    """Stream the N-gram table into host memory for the scheduler's lookup.
+    """Install the N-gram table for the scheduler's lookup.
 
     The table stays off the device (``ngram_table.py``): the scheduler gathers
     each batch's rows on the host and only those reach the model.
