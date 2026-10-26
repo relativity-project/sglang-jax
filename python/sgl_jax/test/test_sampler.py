@@ -7,6 +7,7 @@ import numpy as np
 
 from sgl_jax.srt.layers import sampler as sampler_mod
 from sgl_jax.srt.layers.sampler import multinomial_with_seed
+from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 
 
 class TestMultinomialWithSeed(unittest.TestCase):
@@ -134,10 +135,10 @@ def _make_logits(seed: int = 0) -> jax.Array:
 
 
 def _make_args(logits, temperature, top_k, top_p, min_p):
-    """Build the 10-tuple `args` that `Sampler._regular_sampling` passes down.
+    """Build the 12-tuple `args` that `Sampler._regular_sampling` passes down.
 
     `sampling_seeds=None` selects the plain `multinomial`, which is the function
-    `_capture` intercepts.
+    `_capture` intercepts. The need flags follow SamplingBatchInfo's rule.
     """
     temperatures = jnp.full((_BATCH, 1), temperature, dtype=jnp.float32)
     probs = jax.nn.softmax(jnp.divide(logits, temperatures), axis=-1)
@@ -151,6 +152,8 @@ def _make_args(logits, temperature, top_k, top_p, min_p):
         temperatures,
         None,
         jnp.asarray(min_p > 0.0),
+        jnp.asarray(top_p != 1.0),
+        jnp.asarray(top_k != TOP_K_ALL),
         jax.random.PRNGKey(0),
     )
 
@@ -293,6 +296,14 @@ class TestTopKTopPMinPSemantics(unittest.TestCase):
         self.assertTrue(rejected.any(), "min_p=0.30 should reject something")
         # Rejected entries carry exactly zero probability, not merely a small one.
         self.assertTrue(np.all(_sampled_probs(args)[rejected] == 0.0))
+
+    def test_unset_top_k_and_top_p_keep_every_token(self):
+        """With no top_k and top_p = 1 in the batch, the sampler skips both masks
+        and draws from the whole temperature-scaled distribution."""
+        logits = _make_logits()
+        got = _sampled_probs(_make_args(logits, 0.7, TOP_K_ALL, 1.0, 0.0))
+        want = np.asarray(jax.nn.softmax(np.asarray(logits) / 0.7, axis=-1))
+        np.testing.assert_allclose(got, want, rtol=1e-5, atol=0)
 
     def test_min_p_zero_rejects_nothing(self):
         """min_p=0 is the disabled encoding; log(0) = -inf must not mask or NaN."""
