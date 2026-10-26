@@ -480,8 +480,10 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
-        # Merges only OR these, so recompute them for the requests that remain:
-        # a finished top-p request must not keep the rest running its search.
+        # Merges only AND/OR these, so recompute them for the requests that remain:
+        # a finished top-p request must not keep the rest running its search, and
+        # a finished sampled request must not keep greedy ones off argmax.
+        self.is_all_greedy = bool(np.all(self.top_ks <= 1))
         self.need_top_p_sampling = bool(np.any(self.top_ps != 1.0))
         self.need_top_k_sampling = bool(np.any(self.top_ks != TOP_K_ALL))
         self.need_min_p_sampling = bool(np.any(self.min_ps > 0.0))

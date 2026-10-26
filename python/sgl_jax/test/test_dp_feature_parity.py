@@ -194,6 +194,16 @@ def test_sampling_filter_flags_clear_when_the_request_finishes(sampling, flag):
         assert not getattr(info.sampling_info, name), name
 
 
+def test_all_greedy_when_the_sampled_request_finishes():
+    # The sampled request finishes; the greedy one left can take argmax again.
+    batch = make_batch([[make_req("0-0"), make_req("0-1", temperature=0.0)]])
+    info = batch.reqs_info[0]
+    info.sampling_info = SamplingBatchInfo.from_schedule_batch(info, 64)
+    assert not info.sampling_info.is_all_greedy
+    info.sampling_info.filter_batch(np.array([1]))
+    assert info.sampling_info.is_all_greedy
+
+
 class SingleTokenGrammar:
     finished = False
 
