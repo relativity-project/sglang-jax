@@ -480,6 +480,12 @@ class SamplingBatchInfo:
             if value is not None:
                 setattr(self, item, value[keep_indices])
 
+        # Merges only OR these, so recompute them for the requests that remain:
+        # a finished top-p request must not keep the rest running its search.
+        self.need_top_p_sampling = bool(np.any(self.top_ps != 1.0))
+        self.need_top_k_sampling = bool(np.any(self.top_ks != TOP_K_ALL))
+        self.need_min_p_sampling = bool(np.any(self.min_ps > 0.0))
+
     def merge_batch(self, other: SamplingBatchInfo):
         if self.penalizer_orchestrator is not None:
             self.penalizer_orchestrator.merge(other.penalizer_orchestrator)

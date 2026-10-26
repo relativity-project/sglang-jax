@@ -204,11 +204,11 @@ def _total_variation(a, b):
 
 # (name, temperature, top_k, top_p, min_p)
 _CONFIGS = [
-    ("top_p only", 0.6, _VOCAB, 0.95, 0.0),
+    ("top_p only", 0.6, TOP_K_ALL, 0.95, 0.0),
     ("top_k only", 0.7, 20, 1.0, 0.0),
     ("top_k + top_p", 0.7, 20, 0.80, 0.0),
     ("top_k + top_p + min_p", 0.8, 50, 0.90, 0.10),
-    ("min_p only", 1.0, _VOCAB, 1.0, 0.05),
+    ("min_p only", 1.0, TOP_K_ALL, 1.0, 0.05),
     ("temperature 1.0", 1.0, 20, 0.80, 0.02),
     ("top_p tighter than top_k", 0.7, 200, 0.30, 0.0),
 ]
@@ -304,6 +304,17 @@ class TestTopKTopPMinPSemantics(unittest.TestCase):
         got = _sampled_probs(_make_args(logits, 0.7, TOP_K_ALL, 1.0, 0.0))
         want = np.asarray(jax.nn.softmax(np.asarray(logits) / 0.7, axis=-1))
         np.testing.assert_allclose(got, want, rtol=1e-5, atol=0)
+
+    def test_top_p_one_keeps_every_token_beside_top_p_rows(self):
+        """A row with top_p = 1 keeps its whole distribution even when another row
+        in the batch makes the sampler run the top-p search."""
+        logits = _make_logits()
+        args = list(_make_args(logits, 0.7, TOP_K_ALL, 0.9, 0.0))
+        # Row 1 is where the search drops two tail tokens at p = 1 on this fixture.
+        args[3] = jnp.array([0.9, 1.0, 0.9, 1.0], dtype=jnp.float32)  # top_ps
+        got = _sampled_probs(tuple(args))
+        want = np.asarray(jax.nn.softmax(np.asarray(logits) / 0.7, axis=-1))
+        np.testing.assert_allclose(got[1::2], want[1::2], rtol=1e-5, atol=0)
 
     def test_min_p_zero_rejects_nothing(self):
         """min_p=0 is the disabled encoding; log(0) = -inf must not mask or NaN."""
