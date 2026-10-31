@@ -99,6 +99,27 @@ class TTAttentionMetadata:
     prefill_input_indices: jax.Array | None = None
     prefill_output_indices: jax.Array | None = None
 
+    # The fused speculative JITs start from each request's page table
+    # (get_eagle_base_metadata) and add the rest on device.
+    def for_chain(self, seq_lens: jax.Array, tokens: int) -> TTAttentionMetadata:
+        """Metadata for `tokens` query tokens per request (verify, draft
+        extend); requests with a zero length are padding."""
+
+        def repeat(x):
+            return jnp.repeat(x, tokens, axis=0, out_sharding=jax.typeof(x).sharding)
+
+        return TTAttentionMetadata(
+            page_table=repeat(self.page_table),
+            positions=repeat(jnp.where(seq_lens > 0, seq_lens, -1)),
+        )
+
+    def for_step(self, positions: jax.Array) -> TTAttentionMetadata:
+        """Metadata for one token per request at `positions` (a draft step);
+        position 0 marks padding."""
+        return TTAttentionMetadata(
+            page_table=self.page_table, positions=jnp.where(positions > 0, positions, -1)
+        )
+
 
 def _pad_page_table(table: np.ndarray, users: int) -> np.ndarray:
     return np.pad(
@@ -192,13 +213,16 @@ class TTAttention(AttentionBackend):
             return self._decode_metadata(batch)
         raise ValueError(f"TT attention does not support {batch.forward_mode}")
 
-    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, *, page_indices, **_):
-        """Metadata for linear-chain verification and DFlash draft blocks.
+    def get_eagle_forward_metadata(self, batch: ModelWorkerBatch, *, page_indices=None, **_):
+        """Metadata for linear-chain verification and DFlash draft blocks; an
+        EAGLE draft prefill is an ordinary prefill.
 
         Every query token is a decode user holding its request's page table.
         The positions attend over the whole block; causal layers narrow them
         to each token's own position in `_verify`.
         """
+        if batch.forward_mode == ForwardMode.EXTEND:
+            return self._prefill_metadata(batch)
         if batch.forward_mode != ForwardMode.TARGET_VERIFY:
             raise ValueError(f"TT speculative attention does not support {batch.forward_mode}")
         if batch.spec_info_padded.custom_mask is not None:
@@ -222,6 +246,46 @@ class TTAttention(AttentionBackend):
             sharding=NamedSharding(self.mesh, P("data")),
         )
         return metadata
+
+    def get_eagle_base_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
+        """Each request's page table, which the fused speculative JITs extend
+        on device (TTAttentionMetadata.for_chain and for_step).
+
+        cache_loc holds each live request's allocation, which includes the
+        pages reserved for its draft tokens. allocate_lens comes per batch row
+        or per live request.
+        """
+        lengths = np.asarray(batch.seq_lens)
+        live = lengths > 0
+        allocate_lens = np.asarray(batch.spec_info_padded.allocate_lens)
+        if len(allocate_lens) == len(lengths):
+            allocate_lens = allocate_lens[live]
+        allocated = np.zeros(len(lengths), dtype=np.int64)
+        allocated[live] = allocate_lens
+        page_table = _pad_page_table(
+            _page_table(np.asarray(batch.cache_loc, dtype=np.int32), allocated, self.page_size),
+            users=len(lengths),
+        )
+        metadata = TTAttentionMetadata()
+        metadata.page_table = device_array(page_table, sharding=NamedSharding(self.mesh, P("data")))
+        return metadata
+
+    def get_eagle_multi_step_metadata(self, batch: ModelWorkerBatch):
+        """Metadata for each of an EAGLE draft's decode steps.
+
+        Step i writes and attends up to position seq_len - 1 + i, the next
+        position after the request's verified tokens.
+        """
+        page_table = self.get_eagle_base_metadata(batch).page_table
+        lengths = np.asarray(batch.seq_lens, dtype=np.int32)
+        positions = device_array(
+            [
+                np.where(lengths > 0, lengths - 1 + step, -1).astype(np.int32)
+                for step in range(batch.speculative_num_steps)
+            ],
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
+        return [TTAttentionMetadata(page_table=page_table, positions=step) for step in positions]
 
     def _decode_metadata(self, batch: ModelWorkerBatch) -> TTAttentionMetadata:
         sequence_lengths = np.asarray(batch.seq_lens, dtype=np.int32)[: batch.real_bs]
@@ -340,7 +404,7 @@ class TTAttention(AttentionBackend):
             return self._prefill(q, k, v, layer, token_to_kv_pool)
         if forward_batch.forward_mode == ForwardMode.DECODE:
             return self._decode(q, k, v, layer, token_to_kv_pool)
-        if forward_batch.forward_mode == ForwardMode.TARGET_VERIFY:
+        if forward_batch.forward_mode in (ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND):
             return self._verify(q, k, v, layer, forward_batch, token_to_kv_pool)
         raise ValueError(f"TT attention does not support {forward_batch.forward_mode}")
 
@@ -418,11 +482,23 @@ class TTAttention(AttentionBackend):
 
     def _verify(self, q, k, v, layer, forward_batch, token_to_kv_pool):
         metadata = self.forward_metadata
-        token_to_kv_pool.set_kv_buffer(layer.layer_id, forward_batch.out_cache_loc, k, v)
+        # Each query token is a decode user that writes its K and V at its own
+        # position; causal layers also attend up to it, others to the block.
+        token_positions = jnp.where(metadata.positions >= 0, forward_batch.positions, -1)
+        page_columns = jnp.arange(metadata.page_table.shape[1])
+        page = jnp.where(
+            page_columns == jnp.maximum(token_positions, 0)[:, None] // self.page_size,
+            metadata.page_table,
+            0,
+        ).sum(axis=1)
+        cache_loc = jnp.where(
+            token_positions >= 0, page * self.page_size + token_positions % self.page_size, -1
+        )
+        token_to_kv_pool.set_kv_buffer(layer.layer_id, cache_loc, k, v)
         k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
         positions = metadata.positions
         if layer.attn_type == AttentionType.DECODER:
-            positions = jnp.where(positions >= 0, forward_batch.positions, -1)
+            positions = token_positions
 
         outputs = [
             tt_ops.paged_scaled_dot_product_attention_decode(

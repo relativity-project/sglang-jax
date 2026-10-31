@@ -122,11 +122,16 @@ class RecurrentStatePool:
         head_k_dim: int | None = None,
         conv_states: tuple[ConvStateSpec, ...] | None = None,
         abstract: bool = False,
+        verify_slots_per_rank: int = 0,
     ):
         """`size` is the **global** number of valid slots across all DP ranks
         (mirrors MHATokenToKVPool.size semantics). Internally we partition by
         DP: each rank gets `size // dp_size` valid slots + 1 dummy slot at
         index 0, so total buffer slots = size + dp_size.
+
+        `verify_slots_per_rank` more slots per rank, after its valid ones, hold
+        the states a speculative verify computes after each draft token
+        (`verify_slot`). The allocator never hands them out.
         """
         state_dtype = recurrent_state_dtype()
         if temporal_dtype is None:
@@ -163,6 +168,7 @@ class RecurrentStatePool:
         self.num_k_heads = num_k_heads
         self.head_k_dim = head_k_dim
         self.conv_kernel_size = conv_kernel_size
+        self.verify_slots_per_rank = verify_slots_per_rank
 
         proj_v = num_heads * head_dim
         proj_k = num_k_heads * head_k_dim
@@ -218,7 +224,8 @@ class RecurrentStatePool:
         self.recurrent_buffers, self.conv_buffers = self._create_buffers(abstract=abstract)
 
     def _create_buffers(self, *, abstract: bool = False) -> tuple[list, list]:
-        recurrent_shape = (self.total_slots, self.num_heads, self.head_dim, self.head_dim)
+        slots = self.total_slots + self.dp_size * self.verify_slots_per_rank
+        recurrent_shape = (slots, self.num_heads, self.head_dim, self.head_dim)
 
         if abstract:
             return (
@@ -231,7 +238,7 @@ class RecurrentStatePool:
                 [
                     [
                         jax.ShapeDtypeStruct(
-                            (self.total_slots, s.channels, s.state_len),
+                            (slots, s.channels, s.state_len),
                             self.conv_dtype,
                             sharding=self.conv_sharding,
                         )
@@ -247,7 +254,7 @@ class RecurrentStatePool:
         )
         alloc_conv = {
             spec.name: _get_recurrent_zero_allocator(
-                (self.total_slots, spec.channels, spec.state_len),
+                (slots, spec.channels, spec.state_len),
                 self.conv_dtype,
                 self.conv_sharding,
             )
@@ -414,6 +421,7 @@ class RecurrentStatePool:
             self.recurrent_sharding,
             self.conv_sharding,
             self.conv_specs,
+            self.verify_slots_per_rank,
         )
         return children, aux
 
@@ -438,6 +446,7 @@ class RecurrentStatePool:
             recurrent_sharding,
             conv_sharding,
             conv_specs,
+            verify_slots_per_rank,
         ) = aux_data
         obj = cls.__new__(cls)
         obj.linear_recurrent_layer_ids = list(linear_recurrent_layer_ids_tup)
@@ -466,6 +475,7 @@ class RecurrentStatePool:
         obj.data_partition_axis = data_partition_axis
         obj.recurrent_sharding = recurrent_sharding
         obj.conv_sharding = conv_sharding
+        obj.verify_slots_per_rank = verify_slots_per_rank
         new_recurrent, new_conv = children
         obj.recurrent_buffers = list(new_recurrent)
         obj.conv_buffers = [list(inner) for inner in new_conv]

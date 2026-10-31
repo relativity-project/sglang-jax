@@ -5,30 +5,39 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.hardware_backend.tt.attention import ops
-from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import TTAttention
+from sgl_jax.srt.hardware_backend.tt.attention.tt_backend import (
+    MAX_DECODE_USERS,
+    TTAttention,
+)
 from sgl_jax.srt.kernels.gdn.gated_delta import _l2norm
 from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
     LinearRecurrentAttnBackendMetadata,
 )
 from sgl_jax.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import device_array
 
 
 @jax.tree_util.register_pytree_node_class
 @dataclass
 class TTGDNMetadata(LinearRecurrentAttnBackendMetadata):
     max_prefill_len: int = 0
+    # Speculative verify: draft tokens per request, 0 otherwise.
+    verify_tokens: int = 0
 
     def tree_flatten(self):
         children, _ = super().tree_flatten()
-        return children, self.max_prefill_len
+        return children, (self.max_prefill_len, self.verify_tokens)
 
     @classmethod
-    def tree_unflatten(cls, max_prefill_len, children):
+    def tree_unflatten(cls, aux, children):
         meta = super().tree_unflatten({}, children)
-        meta.max_prefill_len = max_prefill_len
+        meta.max_prefill_len, meta.verify_tokens = aux
         return meta
 
 
@@ -62,6 +71,65 @@ def _per_device(forward):
     return run
 
 
+def verify_state_slots(slots, tokens: int, slots_per_rank: int):
+    """[B, tokens] slots for the state after each of a verify's tokens.
+
+    The state after the last token goes to the request's own slot, the others
+    to the request's verify slots. Rows with slot 0 (padding) stay 0.
+    """
+    steps = jnp.arange(tokens, dtype=jnp.int32)
+    first = slots_per_rank + 1 + (slots - 1) * (tokens - 1)
+    states = jnp.where(steps == tokens - 1, slots[:, None], first[:, None] + steps)
+    return jnp.where(slots[:, None] > 0, states, 0).astype(jnp.int32)
+
+
+def accepted_state_slots(slots, accepted, tokens: int, slots_per_rank: int):
+    """The verify slot holding each request's state after its `accepted`
+    tokens (of `tokens`), or 0 where the request's own slot already holds it
+    or the row is padding."""
+    states = verify_state_slots(slots, tokens, slots_per_rank)
+    count = jnp.clip(accepted, 1, tokens)
+    picked = jnp.arange(tokens) == (count - 1)[:, None]
+    source = jnp.where(picked, states, 0).sum(axis=1)
+    return jnp.where(count < tokens, source, 0).astype(jnp.int32)
+
+
+@functools.cache
+def _keep_states(mesh, tokens: int, slots_per_rank: int):
+    """A program that, after a verify of `tokens` tokens per request, copies
+    each request's state after its accepted tokens from its verify slot to
+    its own slot, in place, in every layer's recurrent and convolution pools."""
+
+    def copy(pool, source, target):
+        for start in range(0, source.shape[0], MAX_DECODE_USERS):
+            rows = slice(start, start + MAX_DECODE_USERS)
+            pool = ops.state_pool_copy(pool, source[rows], target[rows])
+        return pool
+
+    def keep(recurrent, conv, slots, accepted):
+        source = accepted_state_slots(slots, accepted, tokens, slots_per_rank)
+        target = jnp.where(source > 0, slots, 0)
+        rows = P("data")
+        copy_states = jax.shard_map(
+            copy,
+            mesh=mesh,
+            in_specs=(P("data", "tensor", None, None), rows, rows),
+            out_specs=P("data", "tensor", None, None),
+        )
+        copy_windows = jax.shard_map(
+            copy,
+            mesh=mesh,
+            in_specs=(P("data", "tensor", None), rows, rows),
+            out_specs=P("data", "tensor", None),
+        )
+        return (
+            [copy_states(pool, source, target) for pool in recurrent],
+            [[copy_windows(pool, source, target) for pool in pools] for pools in conv],
+        )
+
+    return jax.jit(keep, donate_argnums=(0, 1), compiler_options=TTGDNAttnBackend.compiler_options)
+
+
 class TTGDNAttnBackend(GDNAttnBackend):
     # Quantize only annotated matrix weights; recurrent arithmetic stays FP32.
     compiler_options = {
@@ -81,6 +149,8 @@ class TTGDNAttnBackend(GDNAttnBackend):
             raise NotImplementedError("TT GDN requires 128-wide heads and a four-tap convolution")
 
     def get_forward_metadata(self, batch):
+        if batch.forward_mode == ForwardMode.TARGET_VERIFY:
+            return self._verify_metadata(batch)
         meta = super().get_forward_metadata(batch)
         if batch.forward_mode.is_extend():
             # Prefill packs each live sequence; exclude the scheduler's dummy rows.
@@ -94,6 +164,38 @@ class TTGDNAttnBackend(GDNAttnBackend):
             meta = TTGDNMetadata(
                 **vars(meta), max_prefill_len=1 << (max(length, 32) - 1).bit_length()
             )
+        return meta
+
+    def keep_accepted(self, pool, accepted, tokens: int) -> None:
+        """After the current verify, keep each request's state after its
+        `accepted` tokens (one count per verify row, on device). The copy is in
+        place: the next forward's trace was captured with the pool's current
+        buffers."""
+        keep = _keep_states(self.mesh, tokens, pool.slots_per_rank)
+        pool.replace_buffer(
+            keep(
+                pool.recurrent_buffers,
+                pool.conv_buffers,
+                self.forward_metadata.recurrent_indices,
+                accepted,
+            )
+        )
+
+    def _verify_metadata(self, batch):
+        """Each request verifies a linear chain of draft tokens."""
+        size = len(batch.seq_lens)
+        # Padding rows and precompile's dummy batches, which come without
+        # recurrent slots, use slot 0, which the kernels never write. A verified
+        # request always has a state.
+        slots = np.zeros(size, dtype=np.int32)
+        if batch.recurrent_indices is not None:
+            indices = np.asarray(batch.recurrent_indices)[:size]
+            slots[: len(indices)] = indices
+        meta = TTGDNMetadata(verify_tokens=batch.spec_info_padded.draft_token_num)
+        meta.recurrent_indices, meta.has_initial_state = device_array(
+            (slots, np.ones(size, dtype=bool)),
+            sharding=NamedSharding(self.mesh, P("data")),
+        )
         return meta
 
     def _metadata(self, meta):
@@ -142,8 +244,71 @@ class TTGDNAttnBackend(GDNAttnBackend):
         )
         return out.astype(mixed_qkv.dtype), new_conv, new_rec
 
+    def forward_extend(self, *args, seq_lens):
+        if self.forward_metadata.verify_tokens:
+            return self._forward_verify(*args)
+        return self._forward_prefill(*args, seq_lens=seq_lens)
+
     @_per_device
-    def forward_extend(
+    def _forward_verify(
+        self,
+        meta,
+        mixed_qkv,
+        conv_state_in,
+        recurrent_state_in,
+        b,
+        a,
+        conv1d_weight,
+        A_log,
+        dt_bias,
+    ):
+        """Run each request's draft tokens and keep the state after each one.
+
+        The state after token t goes to slot ``states[:, t]``: the request's
+        own slot for the last token, its verify slots (``verify_state_slots``)
+        for the others. Once the accepted count is known, the speculative
+        worker copies its state to the request's slot.
+        """
+        tokens = meta.verify_tokens
+        indices, initial = meta.recurrent_indices, meta.has_initial_state
+        batch = indices.shape[0]
+        rows = recurrent_state_in.shape[0]
+        if (rows - 1) % tokens:
+            raise ValueError("The recurrent state pool has no verify slots for this draft length")
+        states = verify_state_slots(indices, tokens, (rows - 1) // tokens)
+
+        # The kernels carry each state through its tokens and write the state
+        # after each one to its slot, a tile row of tokens per call.
+        conv, state, outputs = conv_state_in, recurrent_state_in, []
+        group = max(1, MAX_DECODE_USERS // tokens)
+        for start in range(0, batch, group):
+            requests = slice(start, start + group)
+            steps = slice(start * tokens, (start + group) * tokens)
+            conv, convolved = ops.causal_conv1d_update(
+                conv,
+                mixed_qkv[steps],
+                conv1d_weight,
+                indices[requests],
+                initial[requests],
+                state_slots=states[requests],
+            )
+            state, out = ops.gated_delta_decode(
+                state,
+                convolved,
+                b[steps],
+                a[steps],
+                A_log,
+                dt_bias,
+                indices[requests],
+                initial[requests],
+                state_slots=states[requests],
+            )
+            outputs.append(out)
+        out = jnp.concatenate(outputs)
+        return out.astype(mixed_qkv.dtype), conv, state
+
+    @_per_device
+    def _forward_prefill(
         self,
         meta,
         mixed_qkv,

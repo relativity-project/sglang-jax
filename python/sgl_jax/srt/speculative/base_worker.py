@@ -93,9 +93,9 @@ class BaseSpecWorker:
             self.speculative_algorithm.is_nextn() and can_use_linear_fused_verify
         )
         self._can_use_fused_eagle3_verify = (
-            self.speculative_algorithm.is_eagle3()
+            (self.speculative_algorithm.name, server_args.attention_backend)
+            in (("EAGLE3", "fa"), ("EAGLE", "tt"))
             and can_use_linear_fused_verify
-            and server_args.attention_backend == "fa"
             and os.getenv("SGL_JAX_DISABLE_FUSED_EAGLE3_RECURRENT_DRAFT") != "1"
         )
 
